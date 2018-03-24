@@ -49,6 +49,7 @@ Allocator::Allocator(lmdb::env& env) try : dbi(0) {
     dbi = lmdb::dbi::open(txn, database_name, MDB_CREATE);
     dbi.put(txn, key, data);
   }
+  dbi.set_compare(txn, AllocatorCompare);
   txn.commit();
 } catch (const lmdb::error& e) {
   std::cout << e.what();

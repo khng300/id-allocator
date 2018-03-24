@@ -70,6 +70,7 @@ IndexStore::IndexStore(lmdb::env& env, Allocator& allocator) try
       allocator(allocator) {
   lmdb::txn txn = lmdb::txn::begin(env);
   dbi = lmdb::dbi::open(txn, database_name, MDB_CREATE);
+  dbi.set_compare(txn, IndexStoreCompare);
   txn.commit();
 } catch (const lmdb::error& e) {
   std::cout << e.what();
@@ -112,9 +113,11 @@ bool IndexStore::IndexExist(lmdb::txn& txn, const std::string& index) {
 
     // Search in the database for the component.
     lmdb::val val_index(str);
-    if (!cursor.get(val_index, MDB_SET) || (i == n - 1 && !e->is_leaf)) {
+    if (!cursor.get(val_index, MDB_SET_KEY) ||
+        (i == n - 1 && !val_index.data<IndexEntry>()->is_leaf)) {
       // If we do not find the intermediate index entry, or we find the last
-      // entry's #is_leaf set to 0, that implies we did not find corresponding index.
+      // entry's #is_leaf set to 0, that implies we did not find corresponding
+      // index.
       return false;
     }
     parent_id = val_index.data<IndexEntry>()->id;
@@ -139,9 +142,11 @@ bool IndexStore::GetIndex(lmdb::txn& txn,
 
     // Search in the database for the component.
     lmdb::val val_index(str);
-    if (!cursor.get(val_index, MDB_SET) || (i == n - 1 && !e->is_leaf)) {
+    if (!cursor.get(val_index, MDB_SET_KEY) ||
+        (i == n - 1 && !val_index.data<IndexEntry>()->is_leaf)) {
       // If we do not find the intermediate index entry, or we find the last
-      // entry's #is_leaf set to 0, that implies we did not find corresponding index.
+      // entry's #is_leaf set to 0, that implies we did not find corresponding
+      // index.
       return false;
     }
     parent_id = val_index.data<IndexEntry>()->id;
@@ -172,7 +177,7 @@ void IndexStore::SetIndex(lmdb::txn& txn,
 
     // Search in the database for the component.
     lmdb::val val_index(str), val_data;
-    if (!cursor.get(val_index, val_data, MDB_SET)) {
+    if (!cursor.get(val_index, val_data, MDB_SET_KEY)) {
       val_index = {str};
       // If we do not find the intermediate index entry, we need to insert
       // one into the index store.
@@ -221,7 +226,8 @@ void IndexStore::DeleteIndex(lmdb::txn& txn, const std::string& index) {
 
     // Search in the database for the index entry.
     lmdb::val val_index(str);
-    if (!cursor.get(val_index, MDB_SET) || (i == n - 1 && !e->is_leaf)) {
+    if (!cursor.get(val_index, MDB_SET_KEY) ||
+        (i == n - 1 && !val_index.data<IndexEntry>()->is_leaf)) {
       // If we do not find the intermediate index entry, or we find the last
       // entry's #is_leaf set to 0, that implies we did not find corresponding
       // index.
@@ -229,7 +235,7 @@ void IndexStore::DeleteIndex(lmdb::txn& txn, const std::string& index) {
     }
     // Update the properties of index entry in #entry_list for later deletion
     memcpy(e, val_index.data(), sizeof(IndexEntry));
-    
+
     parent_id = e->id;
     i++;
   }
@@ -240,7 +246,6 @@ void IndexStore::DeleteIndex(lmdb::txn& txn, const std::string& index) {
     lmdb::val val_index(str), val_data;
     // Seek to the index entry we found
     if (cursor.get(val_index, val_data, MDB_SET)) {
-      val_index = {str};
       IndexEntry* e = reinterpret_cast<IndexEntry*>(&str[0]);
 
       // Prepare to update the index entry by first deleting it, since we
