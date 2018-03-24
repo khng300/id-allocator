@@ -1,6 +1,6 @@
 [submodule "src/include/lmdbxx"]
 	path = src/include/lmdbxx
-	url = https://github.com/bendiken/lmdbxx
+	url = https://github.com/khng300/lmdbxx
 [submodule "third_party/lmdb"]
 	path = third_party/lmdb
 	url = https://github.com/LMDB/lmdb
