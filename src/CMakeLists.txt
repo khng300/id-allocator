@@ -1,3 +1,4 @@
+include_directories (${LMDB_INCLUDE_DIR})
 include_directories (include)
 set (SRC
      allocator.cc
