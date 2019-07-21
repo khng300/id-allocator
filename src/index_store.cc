@@ -1,5 +1,6 @@
 #include "index_store.h"
 
+#include <algorithm>
 #include <iostream>
 #include <list>
 #include <memory>
@@ -11,7 +12,7 @@
 //
 
 // Name of the database
-static const char* database_name = "IndexStore";
+static const char *database_name = "IndexStore";
 
 // The maximum number of ID allowed
 static constexpr uint64_t max_parent_id = (uint64_t)-1;
@@ -44,9 +45,9 @@ struct IndexEntry {
 // 1. Parent ID
 // 2. Part of Key Content (component)
 //
-static int IndexStoreCompare(const MDB_val* a, const MDB_val* b) {
-  IndexEntry* ie_a = static_cast<IndexEntry*>(a->mv_data);
-  IndexEntry* ie_b = static_cast<IndexEntry*>(b->mv_data);
+static int IndexStoreCompare(const MDB_val *a, const MDB_val *b) {
+  IndexEntry *ie_a = static_cast<IndexEntry *>(a->mv_data);
+  IndexEntry *ie_b = static_cast<IndexEntry *>(b->mv_data);
   if (ie_a->parent_id != ie_b->parent_id) {
     return (ie_a->parent_id < ie_a->parent_id) ? -1 : 1;
   }
@@ -65,14 +66,14 @@ static int IndexStoreCompare(const MDB_val* a, const MDB_val* b) {
 //
 // Initialize the index store
 //
-IndexStore::IndexStore(lmdb::env& env, Allocator& allocator) try
+IndexStore::IndexStore(lmdb::env &env, Allocator &allocator) try
     : dbi(0),
       allocator(allocator) {
   lmdb::txn txn = lmdb::txn::begin(env);
   dbi = lmdb::dbi::open(txn, database_name, MDB_CREATE);
   dbi.set_compare(txn, IndexStoreCompare);
   txn.commit();
-} catch (const lmdb::error& e) {
+} catch (const lmdb::error &e) {
   std::cout << e.what();
   throw;
 }
@@ -82,7 +83,7 @@ IndexStore::IndexStore(lmdb::env& env, Allocator& allocator) try
 //
 IndexStore::~IndexStore() noexcept {}
 
-static std::list<std::string> ChopIndex(const std::string& index) {
+static std::list<std::string> ChopIndex(const std::string &index) {
   size_t off = 0;
   std::list<std::string> entry_list;
   while (off < index.size()) {
@@ -90,7 +91,7 @@ static std::list<std::string> ChopIndex(const std::string& index) {
                              ? index.size() - off
                              : max_part_size;
     std::string entry_buffer(sizeof(IndexEntry) + part_size, 0);
-    IndexEntry* e = reinterpret_cast<IndexEntry*>(&entry_buffer[0]);
+    IndexEntry *e = reinterpret_cast<IndexEntry *>(&entry_buffer[0]);
     e->part_size = part_size;
     memcpy(e->part, index.data() + off, part_size);
     entry_list.push_back(entry_buffer);
@@ -100,15 +101,15 @@ static std::list<std::string> ChopIndex(const std::string& index) {
   return entry_list;
 }
 
-bool IndexStore::IndexExist(lmdb::txn& txn, const std::string& index) {
+bool IndexStore::IndexExist(lmdb::txn &txn, const std::string &index) {
   uint64_t parent_id = max_parent_id;
   std::list<std::string> entry_list = ChopIndex(index);
   size_t i = 0, n = entry_list.size();
 
   lmdb::cursor cursor = lmdb::cursor::open(txn, dbi);
   // First use #max_parent_id for the first component
-  for (std::string& str : entry_list) {
-    IndexEntry* e = reinterpret_cast<IndexEntry*>(&str[0]);
+  for (std::string &str : entry_list) {
+    IndexEntry *e = reinterpret_cast<IndexEntry *>(&str[0]);
     e->parent_id = parent_id;
 
     // Search in the database for the component.
@@ -127,17 +128,16 @@ bool IndexStore::IndexExist(lmdb::txn& txn, const std::string& index) {
   return true;
 }
 
-bool IndexStore::GetIndex(lmdb::txn& txn,
-                          const std::string& index,
-                          std::string& data) {
+bool IndexStore::GetIndex(lmdb::txn &txn, const std::string &index,
+                          std::string &data) {
   uint64_t parent_id = max_parent_id;
   std::list<std::string> entry_list = ChopIndex(index);
   size_t i = 0, n = entry_list.size();
 
   lmdb::cursor cursor = lmdb::cursor::open(txn, dbi);
   // First use #max_parent_id for the first component
-  for (std::string& str : entry_list) {
-    IndexEntry* e = reinterpret_cast<IndexEntry*>(&str[0]);
+  for (std::string &str : entry_list) {
+    IndexEntry *e = reinterpret_cast<IndexEntry *>(&str[0]);
     e->parent_id = parent_id;
 
     // Search in the database for the component.
@@ -162,17 +162,16 @@ bool IndexStore::GetIndex(lmdb::txn& txn,
   return true;
 }
 
-void IndexStore::SetIndex(lmdb::txn& txn,
-                          const std::string& index,
-                          const std::string& data) {
+void IndexStore::SetIndex(lmdb::txn &txn, const std::string &index,
+                          const std::string &data) {
   uint64_t parent_id = max_parent_id;
   std::list<std::string> entry_list = ChopIndex(index);
   size_t i = 0, n = entry_list.size();
 
   lmdb::cursor cursor = lmdb::cursor::open(txn, dbi);
   // First use #max_parent_id for the first component
-  for (std::string& str : entry_list) {
-    IndexEntry* e = reinterpret_cast<IndexEntry*>(&str[0]);
+  for (std::string &str : entry_list) {
+    IndexEntry *e = reinterpret_cast<IndexEntry *>(&str[0]);
     e->parent_id = parent_id;
 
     // Search in the database for the component.
@@ -181,7 +180,8 @@ void IndexStore::SetIndex(lmdb::txn& txn,
       val_index = {str};
       // If we do not find the intermediate index entry, we need to insert
       // one into the index store.
-      allocator.IdAllocate(txn, &e->id);
+      auto r = allocator.IdAllocate(txn, 1);
+      e->id = r->first;
       e->refcount = 1;
       if (i == n - 1) {
         e->is_leaf = true;
@@ -213,15 +213,15 @@ void IndexStore::SetIndex(lmdb::txn& txn,
   }
 }
 
-void IndexStore::DeleteIndex(lmdb::txn& txn, const std::string& index) {
+void IndexStore::DeleteIndex(lmdb::txn &txn, const std::string &index) {
   uint64_t parent_id = max_parent_id;
   std::list<std::string> entry_list = ChopIndex(index);
   size_t i = 0, n = entry_list.size();
 
   lmdb::cursor cursor = lmdb::cursor::open(txn, dbi);
   // First use #max_parent_id for the first component
-  for (std::string& str : entry_list) {
-    IndexEntry* e = reinterpret_cast<IndexEntry*>(&str[0]);
+  for (std::string &str : entry_list) {
+    IndexEntry *e = reinterpret_cast<IndexEntry *>(&str[0]);
     e->parent_id = parent_id;
 
     // Search in the database for the index entry.
@@ -242,11 +242,11 @@ void IndexStore::DeleteIndex(lmdb::txn& txn, const std::string& index) {
 
   // Now starts to delete the key from the index store
   i = 0;
-  for (std::string& str : entry_list) {
+  for (std::string &str : entry_list) {
     lmdb::val val_index(str), val_data;
     // Seek to the index entry we found
     if (cursor.get(val_index, val_data, MDB_SET)) {
-      IndexEntry* e = reinterpret_cast<IndexEntry*>(&str[0]);
+      IndexEntry *e = reinterpret_cast<IndexEntry *>(&str[0]);
 
       // Prepare to update the index entry by first deleting it, since we
       // have no way to overwrite the content of the index entry.
@@ -266,7 +266,7 @@ void IndexStore::DeleteIndex(lmdb::txn& txn, const std::string& index) {
           cursor.put(val_index, val_data);
       } else {
         // No one is using the index entry, so we simply delete it.
-        allocator.IdFree(txn, e->id);
+        allocator.IdFree(txn, e->id, 1);
       }
     }
     i++;

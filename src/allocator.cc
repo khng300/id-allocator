@@ -1,5 +1,6 @@
-#include <allocator.h>
+#include "allocator.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <iostream>
@@ -10,7 +11,7 @@
 static constexpr uint64_t maximum_length = UINT64_MAX;
 
 // Name of the database
-static const char* database_name = "Allocator";
+static const char *database_name = "Allocator";
 
 //
 // Extent representing a range of free ID
@@ -25,9 +26,9 @@ struct FreeIdExtent {
 //
 // Free Extent Comparator
 //
-static int AllocatorCompare(const MDB_val* a, const MDB_val* b) {
-  FreeIdExtent* a_ext = static_cast<FreeIdExtent*>(a->mv_data);
-  FreeIdExtent* b_ext = static_cast<FreeIdExtent*>(b->mv_data);
+static int AllocatorCompare(const MDB_val *a, const MDB_val *b) {
+  FreeIdExtent *a_ext = static_cast<FreeIdExtent *>(a->mv_data);
+  FreeIdExtent *b_ext = static_cast<FreeIdExtent *>(b->mv_data);
   assert(a->mv_size == b->mv_size && a->mv_size == sizeof(FreeIdExtent));
 
   if (a_ext->id != b_ext->id)
@@ -38,12 +39,12 @@ static int AllocatorCompare(const MDB_val* a, const MDB_val* b) {
 //
 // Open/create the allocator in the environment
 //
-Allocator::Allocator(lmdb::env& env) try : dbi(0) {
+Allocator::Allocator(lmdb::env &env) try : dbi(0) {
   lmdb::txn txn = lmdb::txn::begin(env);
   try {
     dbi = lmdb::dbi::open(txn, database_name, 0);
-  } catch (lmdb::not_found_error& e) {
-    FreeIdExtent ext = {.id = 0, .length = maximum_length};
+  } catch (lmdb::not_found_error &) {
+    FreeIdExtent ext{0, maximum_length};
     lmdb::val key(&ext, sizeof(FreeIdExtent));
     lmdb::val data{};
     dbi = lmdb::dbi::open(txn, database_name, MDB_CREATE);
@@ -51,7 +52,7 @@ Allocator::Allocator(lmdb::env& env) try : dbi(0) {
   }
   dbi.set_compare(txn, AllocatorCompare);
   txn.commit();
-} catch (const lmdb::error& e) {
+} catch (const lmdb::error &e) {
   std::cout << e.what();
   throw;
 }
@@ -65,39 +66,43 @@ Allocator::~Allocator() noexcept {}
 // free ID database and return the starting ID of the found extent to the
 // caller.
 //
-bool Allocator::IdAllocate(lmdb::txn& txn, object_id_t* const id) {
+optional<std::pair<object_id_t, object_id_t>>
+Allocator::IdAllocate(lmdb::txn &txn, object_id_t len) {
   lmdb::val val_ext;
   lmdb::cursor cursor = lmdb::cursor::open(txn, dbi);
   if (!cursor.get(val_ext, MDB_FIRST))
-    return false;
+    return {};
 
   FreeIdExtent ext = *val_ext.data<FreeIdExtent>();
-  object_id_t id_got = ext.id++;
+  object_id_t alloc_id = ext.id;
+  object_id_t alloc_id_len = std::min(ext.length, len);
   cursor.del();
-  if (--ext.length) {
+  ext.id += alloc_id_len;
+  ext.length -= alloc_id_len;
+  if (ext.length) {
     val_ext = lmdb::val(&ext, sizeof(FreeIdExtent));
     cursor.put(val_ext);
   }
 
-  *id = id_got;
-  return true;
+  return {{alloc_id, alloc_id_len}};
 }
 
 //
 // Check if the two extents are consecutive (providing that #a must be smaller
 // than #b)
 //
-static inline bool AllocatorCheckConsecutive(const FreeIdExtent* a,
-                                             const FreeIdExtent* b) {
+static inline bool AllocatorCheckConsecutive(const FreeIdExtent *a,
+                                             const FreeIdExtent *b) {
   return a->id + a->length == b->id;
 }
 
 //
-// Check if an ID is in the range of an extent
+// Check if two extents overlap
 //
-static inline bool AllocatorCheckInRange(const FreeIdExtent* ext,
-                                         object_id_t id) {
-  return id >= ext->id && id < ext->id + ext->length;
+static inline bool AllocatorCheckExtentOverlap(const FreeIdExtent &Extent,
+                                               const FreeIdExtent &NewExtent) {
+  return NewExtent.id <= Extent.id + Extent.length - 1 &&
+         Extent.id <= NewExtent.id + NewExtent.length - 1;
 }
 
 //
@@ -105,63 +110,140 @@ static inline bool AllocatorCheckInRange(const FreeIdExtent* ext,
 //
 // Double free of an ID is prohibited.
 //
-void Allocator::IdFree(lmdb::txn& txn, object_id_t id) {
-  FreeIdExtent lookup_ext = {.id = id, .length = 0};
-  lmdb::val val_ext_found(&lookup_ext, sizeof(FreeIdExtent));
+void Allocator::IdFree(lmdb::txn &txn, object_id_t id, object_id_t len) {
   lmdb::cursor cursor = lmdb::cursor::open(txn, dbi);
+  FreeIdExtent ext{id, 0};
+  lmdb::val val_ext(&ext, sizeof(FreeIdExtent));
+  bool allocator_full = false;
   // First find an extent with its id greater than #id
-  bool found = cursor.get(val_ext_found, MDB_SET_RANGE);
-
-  // Sanity check - #id must not exist in the free ID database
-  assert(!found ||
-         !AllocatorCheckInRange(val_ext_found.data<FreeIdExtent>(), id));
+  bool found = cursor.get(val_ext, MDB_SET_RANGE);
   if (!found) {
-    found = cursor.get(val_ext_found, MDB_LAST);
-    // Sanity check - #id must not exist in the free ID database
-    assert(!AllocatorCheckInRange(val_ext_found.data<FreeIdExtent>(), id));
+    found = cursor.get(val_ext, MDB_LAST);
+    if (!found)
+      allocator_full = true;
   }
 
-  FreeIdExtent new_ext = {.id = id, .length = 1};
-  if (found && id > val_ext_found.data<FreeIdExtent>()->id) {
-    //
-    // Check if we can merge the extent smaller than #new_ext
-    //
-    if (AllocatorCheckConsecutive(val_ext_found.data<FreeIdExtent>(),
-                                  &new_ext)) {
-      new_ext.id = val_ext_found.data<FreeIdExtent>()->id;
-      new_ext.length += val_ext_found.data<FreeIdExtent>()->length;
-      cursor.del();
-    }
-    //
-    // We don't need to check the next extent in this case, as we can only
-    // reach there if there is no more extent greater than #id (Recall that we
-    // failed the first lookup)
-    //
-  } else if (found) {
-    //
-    // Check if we can merge the extent greater than #new_ext
-    //
-    if (AllocatorCheckConsecutive(&new_ext,
-                                  val_ext_found.data<FreeIdExtent>())) {
-      new_ext.length += val_ext_found.data<FreeIdExtent>()->length;
-      cursor.del();
-    }
-    found = cursor.get(val_ext_found, MDB_PREV);
-    // Sanity check - #id must not exist in the free ID database
-    assert(!found ||
-           !AllocatorCheckInRange(val_ext_found.data<FreeIdExtent>(), id));
-    //
-    // Check if we can merge the extent less than #new_ext
-    //
-    if (found && AllocatorCheckConsecutive(val_ext_found.data<FreeIdExtent>(),
-                                           &new_ext)) {
-      new_ext.id = val_ext_found.data<FreeIdExtent>()->id;
-      new_ext.length += val_ext_found.data<FreeIdExtent>()->length;
-      cursor.del();
+  // #NewExtent is the extent to be inserted into the database
+  FreeIdExtent new_ext{id, len};
+  if (!allocator_full) {
+    // There is at least one free extent presented in the database
+    ext = *val_ext.data<FreeIdExtent>();
+    // Sanity check - the range to be freed must not be in database
+    assert(!AllocatorCheckExtentOverlap(lookup_ext, new_ext));
+    if (id > ext.id) {
+      // Check if we can merge the extent smaller than #NewExtent
+      if (AllocatorCheckConsecutive(&ext, &new_ext)) {
+        new_ext.id = ext.id;
+        new_ext.length += ext.length;
+        cursor.del();
+      }
+      // We don't need to check the next extent in this case, as we can only
+      // reach there if there is no more extent greater than #ID (Recall that we
+      // failed the first lookup)
+    } else {
+      // Check if we can merge the extent greater than #NewExtent
+      if (AllocatorCheckConsecutive(&new_ext, &ext)) {
+        new_ext.length += ext.length;
+        cursor.del();
+      }
+
+      // Check if merging with extents preceding #NewExtent is possible
+      found = cursor.get(val_ext, MDB_PREV);
+      if (found) {
+        ext = *val_ext.data<FreeIdExtent>();
+        // Sanity check - the range to be freed must not be in database
+        assert(!AllocatorCheckExtentOverlap(ext, new_ext));
+        // Check if we can merge the extent less than #NewExtent
+        if (AllocatorCheckConsecutive(&ext, &new_ext)) {
+          new_ext.id = ext.id;
+          new_ext.length += ext.length;
+          cursor.del();
+        }
+      }
     }
   }
-
   // Insert the resulting new extent
-  lmdb::val val_new_ext = lmdb::val(&new_ext, sizeof(FreeIdExtent));
-  cursor.put(val_new_ext);
+  cursor.put(lmdb::val(&new_ext, sizeof(FreeIdExtent)), lmdb::val());
 }
+
+#if 0
+
+void Allocator::IdFree(lmdb::txn &txn, object_id_t id, object_id_t len) {
+  lmdb::cursor cursor = lmdb::cursor::open(txn, dbi);
+  FreeIdExtent Extent(ID, 0);
+  lmdb::Val ExtentKey(&Extent.ID), ExtentData;
+  bool AllocatorFull = false;
+  // First find an free extent with its ID greater than #ID
+  auto Err = Cursor.get(ExtentKey, ExtentData, MDB_SET_RANGE);
+  if (Err) {
+    Err = lmdb::filterDBError(std::move(Err), MDB_NOTFOUND);
+    if (Err)
+      return Err;
+    // Get the last free extent in the database instead
+    Err = Cursor.get(ExtentKey, ExtentData, MDB_LAST);
+    if (Err) {
+      Err = lmdb::filterDBError(std::move(Err), MDB_NOTFOUND);
+      if (Err)
+        return Err;
+      AllocatorFull = true;
+    }
+  }
+
+  // #NewExtent is the extent to be inserted into the database
+  FreeIdExtent NewExtent(ID, Length);
+  if (!AllocatorFull) {
+    // There is at least one free extent presented in the database
+    Extent.ID = *ExtentKey.data<RecordID>();
+    Extent.Length = *ExtentData.data<RecordID>();
+    // Sanity check - the range to be freed must not be in database
+    assert(!AllocatorCheckExtentOverlap(Extent, NewExtent));
+    if (ID > Extent.ID) {
+      // Check if we can merge the extent smaller than #NewExtent
+      if (AllocatorCheckConsecutive(Extent, NewExtent)) {
+        NewExtent.ID = Extent.ID;
+        NewExtent.Length += Extent.Length;
+        Err = Cursor.del();
+        if (Err)
+          return Err;
+      }
+      // We don't need to check the next extent in this case, as we can only
+      // reach there if there is no more extent greater than #ID (Recall that we
+      // failed the first lookup)
+    } else {
+      // Check if we can merge the extent greater than #NewExtent
+      if (AllocatorCheckConsecutive(NewExtent, Extent)) {
+        NewExtent.Length += Extent.Length;
+        Err = Cursor.del();
+        if (Err)
+          return Err;
+      }
+
+      // Check if merging with extents preceding #NewExtent is possible
+      Err = Cursor.get(ExtentKey, ExtentData, MDB_PREV);
+      if (Err) {
+        Err = lmdb::filterDBError(std::move(Err), MDB_NOTFOUND);
+        if (Err)
+          return Err;
+      } else {
+        Extent.ID = *ExtentKey.data<RecordID>();
+        Extent.Length = *ExtentData.data<RecordID>();
+        // Sanity check - the range to be freed must not be in database
+        assert(!AllocatorCheckExtentOverlap(Extent, NewExtent));
+        // Check if we can merge the extent less than #NewExtent
+        if (AllocatorCheckConsecutive(Extent, NewExtent)) {
+          NewExtent.ID = Extent.ID;
+          NewExtent.Length += Extent.Length;
+          Err = Cursor.del();
+          if (Err)
+            return Err;
+        }
+      }
+    }
+  }
+  // Insert the resulting new extent
+  ExtentKey.assign(&NewExtent.ID, sizeof(RecordID));
+  ExtentData.assign(&NewExtent.Length, sizeof(RecordID));
+  return Cursor.put(ExtentKey, ExtentData, 0);
+}
+
+#endif
